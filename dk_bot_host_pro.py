@@ -1,11 +1,12 @@
-import os, re, json, time, html, logging, uuid, base64
+import os, re, json, time, html, logging, uuid, base64, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 from io import BytesIO
 import requests, telebot, firebase_admin
 from telebot import types
 from firebase_admin import credentials, db
 
-# ORVIX HOSTING BOT. Files are stored in Firebase RTDB as Base64; scripts are NOT executed.
+# ORVIX HOSTING BOT. Telegram file_id references are stored in Firebase RTDB; scripts are NOT executed.
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("orvix-hosting-bot")
 
@@ -349,6 +350,31 @@ def callbacks(c):
         try: bot.answer_callback_query(c.id,"Failed: "+str(e)[:100],show_alert=True)
         except Exception: pass
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            body = b"ORVIX HOSTING BOT is running"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, fmt, *args):
+        log.info("health-server: " + fmt, *args)
+
+def start_health_server():
+    # Render Web Services require an HTTP listener on 0.0.0.0:$PORT.
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info("Health server listening on 0.0.0.0:%s", port)
+    return server
+
 def bootstrap():
     if not ref("plans/free").get():
         ref("plans/free").set({"id":"free","name":"Free","price":0,"days":0,"quotaMb":50,"fileLimit":5,"enabled":True})
@@ -356,4 +382,5 @@ def bootstrap():
 
 if __name__=="__main__":
     bootstrap()
+    health_server = start_health_server()
     bot.infinity_polling(skip_pending=True,timeout=30,long_polling_timeout=30)
