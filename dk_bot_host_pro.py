@@ -1,11 +1,11 @@
-import os, re, json, time, html, logging, uuid
+import os, re, json, time, html, logging, uuid, base64
 from datetime import datetime, timezone
 from io import BytesIO
 import requests, telebot, firebase_admin
 from telebot import types
-from firebase_admin import credentials, db, storage
+from firebase_admin import credentials, db
 
-# Secure storage + subscription bot. Uploaded scripts are stored, NOT executed.
+# ORVIX HOSTING BOT. Files are stored in Firebase RTDB as Base64; scripts are NOT executed.
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("orvix-hosting-bot")
 
@@ -13,16 +13,16 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_ID)))
 DB_URL = os.environ["FIREBASE_DATABASE_URL"]
-BUCKET_NAME = os.environ["FIREBASE_STORAGE_BUCKET"]
 SERVICE_JSON = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
 PAYX_KEY = os.environ["PAYX_API_KEY"]
 PAYX_URL = os.getenv("PAYX_BASE_URL", "https://payx-q1nn.onrender.com").rstrip("/")
-MAX_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", 10 * 1024 * 1024))
+# Telegram file_id storage: RTDB stores references, not file bytes.
+# 0 means no additional application-level size cap; Telegram limits still apply.
+MAX_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "0"))
 ALLOWED = {".py", ".js", ".zip", ".txt", ".json"}
 
 cred = credentials.Certificate(json.loads(SERVICE_JSON))
-firebase_admin.initialize_app(cred, {"databaseURL": DB_URL, "storageBucket": BUCKET_NAME})
-bucket = storage.bucket()
+firebase_admin.initialize_app(cred, {"databaseURL": DB_URL})
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # Admin wizard state: all admin operations are available through buttons.
@@ -31,7 +31,7 @@ ADMIN_CANCEL = "❌ Cancel"
 ADMIN_BACK = "⬅️ Admin Panel"
 
 def ts(): return int(time.time() * 1000)
-def owner(uid): return int(uid) == OWNER_ID
+def owner(uid): return int(uid) in (ADMIN_ID, OWNER_ID)
 def admin(uid): return int(uid) in (ADMIN_ID, OWNER_ID)
 def ref(path): return db.reference(path)
 def user(uid, tg=None):
@@ -94,7 +94,7 @@ def start(m):
     if u.get("blocked") and not admin(m.from_user.id):
         bot.reply_to(m,"⛔ Account blocked."); return
     bot.send_message(m.chat.id,
-        "👋 <b>ORVIX HOSTING BOT</b>\nFirebase file storage + PayX subscriptions.\n"
+        "👋 <b>ORVIX HOSTING BOT</b>\nFirebase Realtime Database file storage + PayX subscriptions.\n"
         "<b>Uploaded scripts are stored only; this bot does not execute them.</b>",
         reply_markup=kb(m.from_user.id))
 
@@ -164,36 +164,50 @@ def plans(m):
 
 @bot.message_handler(func=lambda m:m.text=="📤 Upload File")
 def upload_prompt(m):
-    bot.reply_to(m,f"Send a .py, .js, .zip, .txt or .json file. Max {MAX_BYTES//1048576} MB. Files are stored, not executed.")
+    limit = f"{MAX_BYTES/1048576:.0f} MB" if MAX_BYTES > 0 else "Telegram/account limit"
+    bot.reply_to(m,
+        "Send a .py, .js, .zip, .txt or .json document. "
+        f"Extra bot limit: {limit}. Files are kept on Telegram; "
+        "Firebase stores only file references and metadata. Files are not executed.")
 
 @bot.message_handler(content_types=["document"])
 def upload(m):
     uid=m.from_user.id; u=user(uid,m.from_user); d=m.document
-    if u.get("blocked") and not admin(uid): bot.reply_to(m,"⛔ Account blocked."); return
+    if u.get("blocked") and not admin(uid):
+        bot.reply_to(m,"⛔ Account blocked."); return
     name=os.path.basename(d.file_name or "file")
     ext=os.path.splitext(name)[1].lower()
-    if ext not in ALLOWED: bot.reply_to(m,"❌ File type not allowed."); return
-    if int(d.file_size or 0)>MAX_BYTES: bot.reply_to(m,"❌ File too large."); return
+    if ext not in ALLOWED:
+        bot.reply_to(m,"❌ File type not allowed. Allowed: .py, .js, .zip, .txt, .json"); return
+    size=int(d.file_size or 0)
+    if MAX_BYTES > 0 and size > MAX_BYTES:
+        bot.reply_to(m,f"❌ File too large. Extra bot limit: {MAX_BYTES//1048576} MB."); return
     p=plan_for(uid)
     if not owner(uid):
         if int(u.get("fileCount",0))>=int(p.get("fileLimit",5)):
             bot.reply_to(m,"❌ File limit reached. Upgrade your plan."); return
-        if int(u.get("usedBytes",0))+int(d.file_size or 0)>int(p.get("quotaMb",50))*1048576:
-            bot.reply_to(m,"❌ Storage quota reached. Upgrade or delete files."); return
+        if int(u.get("usedBytes",0))+size>int(p.get("quotaMb",50))*1048576:
+            bot.reply_to(m,"❌ Storage quota reached. Upgrade your plan."); return
     try:
-        fi=bot.get_file(d.file_id); data=bot.download_file(fi.file_path)
-        if len(data)>MAX_BYTES: raise ValueError("Upload exceeds size limit")
         safe=re.sub(r"[^A-Za-z0-9._-]","_",name)[:80]
-        path=f"users/{uid}/{ts()}_{safe}"
-        blob=bucket.blob(path)
-        blob.metadata={"telegram_user_id":str(uid),"original_name":safe,"uploaded_at":str(ts())}
-        blob.upload_from_string(data,content_type=d.mime_type or "application/octet-stream")
         fid=ref(f"files/{uid}").push().key
-        ref(f"files/{uid}/{fid}").set({"id":fid,"name":safe,"storagePath":path,"sizeBytes":len(data),"createdAt":ts()})
-        ref(f"users/{uid}").update({"usedBytes":int(u.get("usedBytes",0))+len(data),"fileCount":int(u.get("fileCount",0))+1})
-        bot.reply_to(m,f"✅ Saved to Firebase Storage: <b>{html.escape(safe)}</b>")
+        now=ts()
+        metadata={"id":fid,"name":safe,"sizeBytes":size,
+                  "file_id":d.file_id,"file_unique_id":d.file_unique_id,
+                  "source_chat_id":m.chat.id,"source_message_id":m.message_id,
+                  "storage":"telegram_file_id","createdAt":now,
+                  "archived":False}
+        ref("/").update({
+            f"files/{uid}/{fid}": metadata,
+            f"users/{uid}/usedBytes": int(u.get("usedBytes",0))+size,
+            f"users/{uid}/fileCount": int(u.get("fileCount",0))+1
+        })
+        bot.reply_to(m,
+            f"✅ File saved: <b>{html.escape(safe)}</b>\n"
+            f"Size: {size/1048576:.2f} MB\nStorage: Telegram file reference")
     except Exception as e:
-        log.exception("upload error"); bot.reply_to(m,"❌ Upload failed: "+html.escape(str(e)[:160]))
+        log.exception("Telegram file reference save error")
+        bot.reply_to(m,"❌ File save failed: "+html.escape(str(e)[:180]))
 
 @bot.message_handler(func=lambda m:m.text=="📁 My Files")
 def files(m):
@@ -201,9 +215,8 @@ def files(m):
     if not items: bot.reply_to(m,"No uploaded files."); return
     mk=types.InlineKeyboardMarkup(); lines=["📁 <b>Your files</b>"]
     for fid,x in list(items.items())[:25]:
-        lines.append(f"• {html.escape(x.get('name','file'))} ({int(x.get('sizeBytes',0))/1024:.1f} KB)")
-        mk.row(types.InlineKeyboardButton("⬇️ "+x.get("name","file")[:18],callback_data="get:"+fid),
-               types.InlineKeyboardButton("🗑 Delete",callback_data="del:"+fid))
+        lines.append(f"• {html.escape(x.get('name','file'))} ({int(x.get('sizeBytes',0))/1048576:.2f} MB)")
+        mk.add(types.InlineKeyboardButton("⬇️ "+x.get("name","file")[:28],callback_data="get:"+fid))
     bot.send_message(m.chat.id,"\n".join(lines),reply_markup=mk)
 
 @bot.message_handler(func=lambda m:m.text=="🆘 Support")
@@ -219,7 +232,7 @@ def admin_panel(m):
            types.InlineKeyboardButton("💰 Set Plan Price",callback_data="adm:setprice"))
     mk.row(types.InlineKeyboardButton("⏸ Disable Plan",callback_data="adm:disable"),
            types.InlineKeyboardButton("▶️ Enable Plan",callback_data="adm:enable"))
-    mk.row(types.InlineKeyboardButton("🗑 Delete Plan",callback_data="adm:delete"))
+    mk.row(types.InlineKeyboardButton("📦 Archive Plan",callback_data="adm:delete"))
     mk.row(types.InlineKeyboardButton("👥 Users",callback_data="adm:users"),
            types.InlineKeyboardButton("💳 Orders",callback_data="adm:orders"))
     mk.row(types.InlineKeyboardButton("🚫 Block User",callback_data="adm:block"),
@@ -256,7 +269,7 @@ def callbacks(c):
             elif action=="plans":
                 ps=ref("plans").get() or {}
                 bot.send_message(c.message.chat.id,"\n".join(f"{k}: ₹{v.get('price')} / {v.get('days')} days" for k,v in ps.items())+
-                    "\n\n/addplan id|name|price|days|quotaMB|fileLimit\n/setprice ID PRICE\n/disableplan ID\n/enableplan ID")
+                    "\n\nUse the buttons in Admin Panel to manage plans. Archived plans remain in the database.")
             elif action=="users":
                 us=ref("users").get() or {}
                 bot.send_message(c.message.chat.id,"\n".join(f"{k} · {html.escape(str(v.get('name','User')))} · blocked={v.get('blocked',False)}" for k,v in list(us.items())[:40]) or "No users")
@@ -278,7 +291,7 @@ def callbacks(c):
             elif action=="enable":
                 ref(f"plans/{pid}/enabled").set(True); bot.send_message(c.message.chat.id,"▶️ Plan enabled.")
             elif action=="delete":
-                ref("plans/"+pid).delete(); bot.send_message(c.message.chat.id,"🗑 Plan deleted.")
+                ref("plans/"+pid).update({"enabled":False,"archived":True,"archivedAt":ts()}); bot.send_message(c.message.chat.id,"📦 Plan archived (record preserved).")
             bot.answer_callback_query(c.id); return
 
         if data.startswith("buy:"):
@@ -317,19 +330,20 @@ def callbacks(c):
             bot.answer_callback_query(c.id,"Payment verified; plan activated.",show_alert=True)
             bot.send_message(c.message.chat.id,account(uid)); return
 
-        if data.startswith(("get:","del:")):
-            action,fid=data.split(":",1); item=ref(f"files/{uid}/{fid}").get()
-            if not item: raise ValueError("File not found")
-            blob=bucket.blob(item["storagePath"])
-            if action=="get":
-                bot.send_document(c.message.chat.id,(item["name"],BytesIO(blob.download_as_bytes())))
-                bot.answer_callback_query(c.id,"Sent")
+        if data.startswith("get:"):
+            fid=data.split(":",1)[1]
+            item=ref(f"files/{uid}/{fid}").get()
+            if not item: raise ValueError("File record not found")
+            if item.get("file_id"):
+                bot.send_document(c.message.chat.id,item["file_id"],caption=item.get("name",""))
             else:
-                blob.delete(); ref(f"files/{uid}/{fid}").delete(); u=user(uid)
-                ref(f"users/{uid}").update({"usedBytes":max(0,int(u.get("usedBytes",0))-int(item.get("sizeBytes",0))),
-                    "fileCount":max(0,int(u.get("fileCount",0))-1)})
-                bot.answer_callback_query(c.id,"Deleted")
-                bot.send_message(c.message.chat.id,"🗑 Deleted from Firebase Storage")
+                # Backward compatibility for legacy Base64 records already in RTDB.
+                data_path=item.get("dataPath") or f"fileData/{uid}/{fid}"
+                encoded=ref(data_path).get()
+                if not encoded: raise ValueError("File reference/data is missing")
+                raw=base64.b64decode(encoded)
+                bot.send_document(c.message.chat.id,(item.get("name","download.bin"),BytesIO(raw)))
+            bot.answer_callback_query(c.id,"File sent")
     except Exception as e:
         log.exception("callback error")
         try: bot.answer_callback_query(c.id,"Failed: "+str(e)[:100],show_alert=True)
